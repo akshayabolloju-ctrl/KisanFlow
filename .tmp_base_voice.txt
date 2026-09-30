@@ -1,0 +1,11 @@
+﻿python : ............
+At line:1 char:1
++ python tests\test_voice_assistant.py 2>&1 | Out-File -Encoding utf8 . ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (............:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+----------------------------------------------------------------------
+Ran 12 tests in 0.425s
+
+OK

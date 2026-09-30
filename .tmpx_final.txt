@@ -1,0 +1,4 @@
+﻿LISTENING on :5000 -> 0
+python processes -> 0
+--- leftover tmp files ---
+.tmpx_final.txt, .tmp_base_voice.txt, .tmp_base_wf.txt, .tmp_pyver.txt

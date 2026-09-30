@@ -1,0 +1,212 @@
+﻿python : 2026-09-29 15:44:17,024 INFO Failed login attempt from 127.0.0.1
+At line:1 char:1
++ python tests\test_workflows.py 2>&1 | Out-File -Encoding utf8 .tmp_ba ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-09-29 15:4... from 127.0.0.1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-09-29 15:44:20,588 WARNING Blocked cross-site POST /api/book (Origin=https://evil.example)
+2026-09-29 15:44:22,286 INFO Failed login attempt from 127.0.0.1
+2026-09-29 15:44:22,450 INFO Failed login attempt from 127.0.0.1
+2026-09-29 15:44:22,616 INFO Failed login attempt from 127.0.0.1
+
+-- health, pages, anonymous access ---------------------------
+PASS  /health reports a connected database
+PASS  GET / renders
+PASS  GET /login renders
+PASS  GET /register renders
+PASS  GET /admin renders
+PASS  anonymous /api/my-booking -> 401
+PASS  anonymous /api/bookings -> 401
+PASS  anonymous /dashboard redirects to /admin
+PASS  unknown API path returns JSON 404
+PASS  security header X-Content-Type-Options present
+
+-- registration and login validation -------------------------
+PASS  register Queue Farmer A
+PASS  duplicate mobile rejected (409)
+PASS  invalid mobile rejected (400)
+PASS  weak password rejected (400)
+PASS  wrong password rejected (401)
+PASS  farmer login works
+PASS  /api/me never returns the password hash
+PASS  /api/register alias works
+PASS  /api/login alias works
+PASS  /api/logout alias works
+
+-- slot creation and validation ------------------------------
+PASS  admin login succeeds
+PASS  admin creates two hourly slots
+PASS  re-running slot creation does not duplicate
+PASS  past date slot creation rejected (400)
+PASS  capacity 0 rejected (400)
+PASS  tier seats must sum to capacity (400)
+PASS  negative tier seats rejected (400)
+PASS  end before start rejected (400)
+PASS  unknown centre rejected (404)
+PASS  non-admin cannot create slots (403)
+PASS  farmer sees slots with per-tier quotas
+PASS  bad slot query rejected (400)
+
+-- booking, token, tier quota, queue isolation ---------------
+PASS  quantity mapping: 5 tons -> High, 1 ton -> Mid, 0.5 -> Low
+PASS  booking without quantity rejected (400)
+PASS  zero quantity rejected (400)
+PASS  high farmer (6t) books and receives a token
+PASS  booking is persisted as Waiting/High with quantity
+PASS  duplicate active booking blocked (409)
+PASS  booking without a crop rejected (400)
+PASS  booking an unknown slot rejected (404)
+PASS  register Queue High Two
+PASS  second High farmer rejected: High quota is 1 (409)
+PASS  register Queue Farmer B
+PASS  mid farmer (2t) books even though a High seat is taken
+PASS  register Queue Farmer B2
+PASS  second Mid farmer (3t) fills the Mid quota
+PASS  register Queue Mid Three
+PASS  third Mid farmer rejected: Mid quota is 2 (409)
+PASS  register Queue Farmer C
+PASS  low farmer (0.5t) takes the last Low seat
+PASS  register Queue Low Two
+PASS  second Low farmer rejected: Low quota is 1 (409)
+PASS  slot reports zero remaining in every tier
+PASS  zero Low seats in other slot -> low farmer refused (409)
+PASS  other centre mid seat still bookable
+PASS  high farmer sees their own booking with tier
+PASS  mid farmer B sees only the High farmer ahead (tier queue)
+PASS  low farmer C is last in the tier queue
+PASS  farmer cannot open another farmer's booking (404)
+PASS  farmer can open their own booking
+
+-- call farmer, targeted notification, status machine --------
+PASS  admin can call farmer A
+PASS  farmer A status becomes Called with nobody ahead
+PASS  farmer A receives the call notification
+PASS  farmer B never receives farmer A notification
+PASS  farmer B is still Waiting
+PASS  calling an already-called farmer stays idempotent (no notification spam)
+PASS  farmer can mark their own notification read
+PASS  a farmer cannot mark someone else's notification read (404)
+PASS  CALLED -> SERVING works
+PASS  SERVING -> COMPLETED works
+PASS  COMPLETED -> CALLED is refused (409)
+PASS  completed booking has nobody ahead
+PASS  advance calls the next waiting farmer in tier order
+PASS  farmer B is now Called
+PASS  farmer B receives their own call notification
+PASS  CALLED -> SERVING -> CANCELLED works for a no-show
+PASS  re-cancelling is a safe no-op that does not spam notifications
+
+-- cancellation, freed capacity, authorisation ---------------
+PASS  register Queue Farmer D
+PASS  finished/cancelled bookings free the tier seats again
+PASS  farmer can cancel their own waiting booking
+PASS  cancelling twice is refused (409)
+PASS  a cancelled farmer can book a new slot
+PASS  re-booked farmer is Waiting again
+PASS  farmer cannot read the admin booking list (403)
+PASS  farmer cannot read admin stats (403)
+PASS  farmer cannot call another farmer (403)
+PASS  farmer cannot cancel another farmer booking (403)
+PASS  admin cannot use farmer-only endpoints (403)
+PASS  farmer is redirected away from the admin dashboard
+PASS  farmer can open the farmer page
+PASS  register Queue Farmer E
+PASS  booking a past date is rejected (400)
+
+-- origin guard, session, concurrent booking -----------------
+PASS  register Queue Farmer F
+PASS  cross-origin booking is blocked (403)
+PASS  same-origin booking is allowed
+PASS  logout ends the session
+PASS  register Concurrent Farmer 0
+PASS  register Concurrent Farmer 1
+PASS  register Concurrent Farmer 2
+PASS  register Concurrent Farmer 3
+PASS  register Concurrent Farmer 4
+PASS  5 concurrent High farmers on a 2-seat High quota -> exactly 2 succeed
+PASS  the losing threads receive a conflict (409)
+PASS  concurrent tokens are unique
+PASS  database holds exactly the capacity (no overbooking)
+
+-- admin stats, filters, login throttling --------------------
+PASS  stats expose every dashboard counter
+PASS  slot capacity summary adds up
+PASS  admin sees the queue list
+PASS  tier filter works
+PASS  invalid tier filter rejected (400)
+PASS  date filter works
+PASS  admin queue is High->Mid->Low ordered
+PASS  status filter works
+PASS  centre filter works
+PASS  invalid status filter rejected (400)
+PASS  queue rows never expose password hashes
+PASS  farmers still cannot read the queue (403)
+PASS  repeated failed logins are throttled (429)
+
+-- rendered pages, i18n assets, mobile markup ----------------
+PASS  farmer page renders the language switcher
+PASS  farmer page loads both i18n files
+PASS  farmer page keeps token, queue, My Turn, notification and cancel elements
+PASS  farmer page uses translation keys instead of hard-coded text
+PASS  no implicit DOM globals are used in the farmer script
+PASS  login page is translatable
+PASS  register page is translatable
+PASS  home page is translatable
+PASS  dashboard renders all counters, filters and the call action
+PASS  slot page renders the slot summary and generator
+PASS  stylesheet still serves and contains the new components
+PASS  static asset /static/i18n.js serves
+PASS  static asset /static/i18n.strings.js serves
+PASS  static asset /static/sw.js serves
+PASS  dictionary carries English, Telugu and Hindi text
+PASS  dictionary covers the farmer booking, queue and call strings
+PASS  static asset /static/voice.js serves
+PASS  farmer page includes voice assistant and large action buttons
+PASS  dictionary covers Phase 1 voice and help keys
+PASS  voice.js publishes the intent provider and parsers at module load
+PASS  voice.js registers KFP1 at module level, outside createSpeechRecognizer
+PASS  farmer page loads voice.js before it constructs the intent detector
+PASS  static asset /static/nlp.js serves
+PASS  nlp.js stays a thin bridge over the Flask endpoints
+PASS  the browser never re-implements the understanding (one nlp.py, req. 10)
+PASS  farmer page wires the NLP pipeline before the voice controller
+PASS  dictionary covers the NLP questions in all three languages
+
+-- NLP understanding, prediction and multi-turn dialog -------
+PASS  kg, kgs, kilo, kilos and kilograms all normalize to unit kg
+PASS  ton and quintal are converted to kilograms
+PASS  number words "5 hundred kg" / "five hundred kg" mean 500 kg
+PASS  crop-name variations map onto the values the booking API accepts
+PASS  "rais" is repaired to Rice and the repair is reported
+PASS  "500 kilows" is understood as 500 kg
+PASS  documented example: intent, date, crop, quantity and confidences
+PASS  all required intents are detected (English)
+PASS  intents are detected in Telugu and Hindi too
+PASS  absolute, relative and dd/mm/yyyy dates are extracted
+PASS  Telugu sentence -> date, crop and quantity (requirement 9)
+PASS  Hindi sentence -> date, crop and quantity
+PASS  "500 k..." predicts kg, kilos and kilograms
+PASS  "ri..." in a crop question predicts rice
+PASS  fragments below the minimum length are never guessed
+PASS  typed "rice 5..." completes quantity and date phrases
+PASS  turn 1 asks for the date and keeps the crop already given
+PASS  turn 2 gives the date and only the quantity is still missing
+PASS  turn 3 is ready and hands the choice to GET /api/slots (requirement 11)
+PASS  a repeated date never turns into kilograms (day-number guard)
+PASS  medium confidence is confirmed before it is accepted (requirement 8)
+PASS  "yes" accepts a held value and the dialog continues
+PASS  "no" clears the held value instead of guessing it
+PASS  low confidence / gibberish asks the farmer to repeat (requirement 8)
+PASS  POST /api/nlp/parse understands a booking sentence without a browser
+PASS  POST /api/nlp/parse hands the slot choice to GET /api/slots (requirement 11)
+PASS  the conversation state round-trips through the browser and keeps the crop
+PASS  reset=True abandons the previous conversation instead of merging it
+PASS  GET /api/nlp/suggest completes "500 k..." from the lexicon and the context
+PASS  GET /api/nlp/suggest stays silent on a fragment too short to predict
+PASS  the NLP endpoints are farmer-only (401 anonymous, 403 for an admin session)
+PASS  one endpoint serves English, Telugu and Hindi turns (requirement 9)
+PASS  nlp.py contains no SQL and no centre-slot arithmetic (requirement 11)
+
+-- results ---------------------------------------------------
+passed: 178   failed: 0
