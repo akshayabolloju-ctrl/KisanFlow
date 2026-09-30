@@ -21,17 +21,27 @@ from urllib.parse import urlparse
 
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 
+import nlp   # local, pure-Python language understanding (no I/O, no database)
+
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-only-change-this-secret')
 app.config.update(
+    SESSION_COOKIE_NAME='session',
+    SESSION_COOKIE_PATH='/',
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '0') == '1',
+    SESSION_REFRESH_EACH_REQUEST=True,
+    # Browser refresh must reuse the same session. A short permanent lifetime
+    # keeps farmer/admin logged in across refresh; default (browser-session
+    # cookie) is kept unless SESSION_DAYS is set.
+    PERMANENT_SESSION_LIFETIME=timedelta(days=int(os.environ.get('SESSION_DAYS', '7'))),
     MAX_CONTENT_LENGTH=64 * 1024,          # every API payload is small
 )
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -43,11 +53,20 @@ DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///procurement.db')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 IS_SQLITE = DATABASE_URL.startswith('sqlite')
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    connect_args={'timeout': 15} if IS_SQLITE else {},
-)
+if IS_SQLITE:
+    # SQLite + Flask dev server: each request thread must get a FRESH file
+    # connection (NullPool) that closes on return. A pooled QueuePool keeps
+    # idle connections holding read locks; after 1-2 writes the next
+    # request blocks on "database is locked" and the UI looks dead.
+    # check_same_thread=False allows the threaded server to use the driver.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        poolclass=NullPool,
+        connect_args={'timeout': 15, 'check_same_thread': False},
+    )
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 if IS_SQLITE:
     @event.listens_for(engine, 'connect')
     def _sqlite_connection_pragmas(dbapi_connection, _record):
@@ -126,7 +145,9 @@ def db_init():
             quantity_tons REAL NOT NULL DEFAULT 0, tier VARCHAR(10) NOT NULL DEFAULT 'Low',
             token INTEGER NOT NULL,
             status VARCHAR(30) NOT NULL DEFAULT 'Waiting', procurement_status VARCHAR(50) NOT NULL DEFAULT 'Booked',
-            payment_status VARCHAR(50) NOT NULL DEFAULT 'Not started', created_at VARCHAR(50) NOT NULL)'''))
+            payment_status VARCHAR(50) NOT NULL DEFAULT 'Not started', created_at VARCHAR(50) NOT NULL,
+            booking_created_at TIMESTAMP, called_at TIMESTAMP, served_at TIMESTAMP,
+            completed_at TIMESTAMP, cancelled_at TIMESTAMP)'''))
         c.execute(text(f'''CREATE TABLE IF NOT EXISTS notifications (
             id {pk}, user_id INTEGER NOT NULL, booking_id INTEGER, message VARCHAR(500) NOT NULL,
             kind VARCHAR(50) NOT NULL DEFAULT 'info', is_read INTEGER NOT NULL DEFAULT 0,
@@ -145,6 +166,9 @@ def db_init():
                 c.execute(text('ALTER TABLE bookings ADD COLUMN quantity_tons REAL NOT NULL DEFAULT 0'))
             if 'tier' not in booking_cols:
                 c.execute(text("ALTER TABLE bookings ADD COLUMN tier VARCHAR(10) NOT NULL DEFAULT 'Low'"))
+            for col in ('booking_created_at', 'called_at', 'served_at', 'completed_at', 'cancelled_at'):
+                if col not in booking_cols:
+                    c.execute(text(f'ALTER TABLE bookings ADD COLUMN {col} TIMESTAMP'))
             slot_cols = {r[1] for r in c.execute(text("PRAGMA table_info(slots)")).fetchall()}
             for col in ('cap_high', 'cap_mid', 'cap_low'):
                 if col not in slot_cols:
@@ -157,10 +181,15 @@ def db_init():
                 WHERE cap_high + cap_mid + cap_low <= 0 AND capacity > 0'''))
             # Old bookings created before quantity: keep them as Low tier.
             c.execute(text("UPDATE bookings SET tier='Low' WHERE tier IS NULL OR tier=''"))
+            # Existing rows have a trustworthy creation time, but no historical
+            # transition times. Preserve what is known; leave the rest NULL.
+            c.execute(text('UPDATE bookings SET booking_created_at=CAST(created_at AS TIMESTAMP) WHERE booking_created_at IS NULL'))
         else:
             c.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_id INTEGER"))
             c.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS quantity_tons DOUBLE PRECISION NOT NULL DEFAULT 0"))
             c.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS tier VARCHAR(10) NOT NULL DEFAULT 'Low'"))
+            for col in ('booking_created_at', 'called_at', 'served_at', 'completed_at', 'cancelled_at'):
+                c.execute(text(f'ALTER TABLE bookings ADD COLUMN IF NOT EXISTS {col} TIMESTAMP'))
             c.execute(text("ALTER TABLE slots ADD COLUMN IF NOT EXISTS cap_high INTEGER NOT NULL DEFAULT 0"))
             c.execute(text("ALTER TABLE slots ADD COLUMN IF NOT EXISTS cap_mid INTEGER NOT NULL DEFAULT 0"))
             c.execute(text("ALTER TABLE slots ADD COLUMN IF NOT EXISTS cap_low INTEGER NOT NULL DEFAULT 0"))
@@ -170,6 +199,7 @@ def db_init():
                     cap_low = capacity - ((capacity * 50) / 100) - ((capacity * 30) / 100)
                 WHERE cap_high + cap_mid + cap_low <= 0 AND capacity > 0'''))
             c.execute(text("UPDATE bookings SET tier='Low' WHERE tier IS NULL OR tier=''"))
+            c.execute(text('UPDATE bookings SET booking_created_at=created_at WHERE booking_created_at IS NULL'))
         if c.execute(text('SELECT COUNT(*) FROM centres')).scalar() == 0:
             c.execute(text("INSERT INTO centres(name,daily_capacity) VALUES ('Main Procurement Centre',40),('Village Collection Centre',30),('District Procurement Centre',60)"))
         admin = c.execute(text("SELECT id FROM users WHERE role='admin' LIMIT 1")).first()
@@ -179,7 +209,10 @@ def db_init():
 
 
 def rows(sql, params=None):
-    with engine.begin() as c:
+    # Read-only queries must NOT open a write transaction (engine.begin()).
+    # On SQLite, holding a BEGIN while polling every 2-3s from two pages can
+    # pile up behind a booking/call write and hang every later request.
+    with engine.connect() as c:
         return [dict(r._mapping) for r in c.execute(text(sql), params or {}).fetchall()]
 
 
@@ -195,11 +228,25 @@ def login_required(role=None):
     def deco(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # CORS preflight never carries cookies; let after_request answer
+            # it (204 + CORS headers) instead of failing it with a 401.
+            if request.method == 'OPTIONS':
+                return ('', 204)
             u = current_user()
+            # API routes must ALWAYS get machine-readable JSON (401/403), never
+            # an HTML redirect. fetch() follows a 302 transparently to /login
+            # (HTTP 200), so the frontend would see "ok" with garbage data and
+            # could neither render status nor redirect — the "stuck" symptom.
+            # Only real HTML pages get redirect responses.
+            is_api = request.path.startswith('/api/') or request.path == '/health'
             if not u:
-                return redirect(url_for('login')) if request.method == 'GET' else jsonify(error='Login required'), 401
+                if is_api or request.method != 'GET':
+                    return jsonify(error='Login required'), 401
+                return redirect(url_for('login'))
             if role and u['role'] != role:
-                return redirect(url_for('home')) if request.method == 'GET' else jsonify(error='Access denied'), 403
+                if is_api or request.method != 'GET':
+                    return jsonify(error='Access denied'), 403
+                return redirect(url_for('home'))
             return fn(*args, **kwargs)
         return wrapper
     return deco
@@ -212,6 +259,11 @@ def one(sql, params=None):
 
 def now_iso():
     return datetime.now().isoformat(timespec='seconds')
+
+
+def lifecycle_now_iso():
+    """Higher precision event time for future duration analysis."""
+    return datetime.now().isoformat(timespec='microseconds')
 
 
 def api_error(message, status=400):
@@ -260,6 +312,34 @@ def booking_write_guard():
     return _sqlite_booking_lock if _sqlite_booking_lock is not None else nullcontext()
 
 
+# Extra allowed browser origins for local split-port dev (e.g. Live Server :5500
+# calling Flask :5000). Same-origin deployments need none of this.
+FRONTEND_ORIGINS = {o.strip().lower() for o in os.environ.get('FRONTEND_ORIGINS', '').replace(',', ' ').split() if o.strip()}
+
+
+def _is_allowed_origin(origin):
+    """True for the request's own host, local loopback on any port, or an
+    explicitly configured FRONTEND_ORIGINS entry. A foreign site such as
+    https://evil.example is never allowed."""
+    try:
+        netloc = urlparse(origin).netloc.lower()
+    except Exception:
+        return False
+    if not netloc:
+        return False
+    host = netloc.split('@')[-1].split(':')[0]
+    allowed_hosts = {
+        (request.host or '').lower().split(':')[0],
+        (request.headers.get('X-Forwarded-Host') or '').lower().split(':')[0],
+        (request.environ.get('HTTP_HOST') or '').lower().split(':')[0],
+        'localhost', '127.0.0.1',
+    }
+    allowed_hosts.discard('')
+    if host in allowed_hosts:
+        return True
+    return netloc in FRONTEND_ORIGINS or origin.lower() in FRONTEND_ORIGINS
+
+
 @app.before_request
 def block_cross_site_writes():
     """Light CSRF defence: browsers send Origin on cross-site writes.
@@ -267,26 +347,23 @@ def block_cross_site_writes():
     Session cookies are already SameSite=Lax, so this only hardens the
     POST/PUT/PATCH/DELETE surface against an obvious foreign origin.
     """
+    if request.method == 'OPTIONS':
+        # CORS preflight carries no cookies; answer here so it never hits
+        # login_required (which would 401 it) or the origin write-block.
+        return ('', 204)
     if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
         return None
     origin = request.headers.get('Origin')
     if not origin:
         return None
-    allowed = {
-        (request.host or '').lower(),
-        (request.headers.get('X-Forwarded-Host') or '').lower(),
-        (request.environ.get('HTTP_HOST') or '').lower(),
-        'localhost', '127.0.0.1', 'localhost:80', 'localhost:443',
-        '127.0.0.1:80', '127.0.0.1:443', 'localhost:5000', '127.0.0.1:5000',
-    }
-    allowed.discard('')
-    if urlparse(origin).netloc.lower() in allowed:
+    if _is_allowed_origin(origin):
         return None
     app.logger.warning('Blocked cross-site %s %s (Origin=%s)', request.method, request.path, origin)
     return api_error('Cross-site request blocked.', 403)
 
 
 @app.get('/health')
+@app.get('/api/health')
 def health():
     """Liveness + database readiness for the cloud platform health check."""
     try:
@@ -319,6 +396,7 @@ def login():
     session.clear()
     session['user_id'] = user[0]['id']
     session['role'] = user[0]['role']
+    session.permanent = True   # survive browser refresh (see PERMANENT_SESSION_LIFETIME)
     return jsonify(success=True, role=user[0]['role'], redirect='/dashboard' if user[0]['role']=='admin' else '/farmer')
 
 @app.route('/register', methods=['GET','POST'])
@@ -351,6 +429,7 @@ def register():
     session.clear()
     session['user_id'] = uid
     session['role'] = 'farmer'
+    session.permanent = True   # survive browser refresh (see PERMANENT_SESSION_LIFETIME)
     return jsonify(success=True, redirect='/farmer'), 201
 
 @app.post('/logout')
@@ -362,6 +441,17 @@ def logout():
 @app.route('/farmer')
 @login_required('farmer')
 def farmer(): return render_template('farmer.html', user=current_user())
+
+@app.route('/farmer/status')
+@login_required('farmer')
+def farmer_status():
+    """Dedicated independent farmer status page (refresh-safe).
+
+    Server-rendered only for authenticated farmers, so F5 re-authenticates via
+    the Flask session cookie and re-renders this page — never the home/login
+    page. All status data loads from the API below; no JS memory is trusted.
+    """
+    return render_template('farmer_status.html', user=current_user())
 
 @app.route('/dashboard')
 def dashboard():
@@ -392,11 +482,25 @@ def admin_login():
     session.clear()
     session['user_id'] = user[0]['id']
     session['role'] = 'admin'
+    session.permanent = True   # survive browser refresh (see PERMANENT_SESSION_LIFETIME)
     return jsonify(success=True, redirect='/admin')
 
 @app.get('/api/me')
 @login_required()
 def me(): return jsonify(current_user())
+
+@app.get('/api/auth/status')
+def auth_status():
+    """Session probe used by protected pages on load/refresh.
+
+    Always HTTP 200 so the frontend can tell 'logged out' apart from
+    'network error' without guessing from 401s. Never exposes hashes:
+    current_user() only selects id/role/name/phone/username.
+    """
+    u = current_user()
+    if not u:
+        return jsonify(authenticated=False, user=None)
+    return jsonify(authenticated=True, user={'id': u['id'], 'role': u['role'], 'name': u.get('name')})
 
 @app.get('/api/centres')
 @login_required()
@@ -472,70 +576,193 @@ def get_slots():
         FROM slots s JOIN centres c ON c.id=s.centre_id
         WHERE s.centre_id=:cid AND s.slot_date=:d ORDER BY s.start_time''',{'cid':cid,'d':raw_date}))
 
+def execute_booking(u, crop, sid, quantity):
+    """Authoritative booking logic with tier quota and concurrency lock."""
+    crop = str(crop or '').strip()[:100]
+    if not crop: return None, 'Choose a crop before booking.', 400
+    try: sid = int(sid)
+    except (TypeError, ValueError): return None, 'Choose an available slot.', 400
+    try:
+        quantity = float(quantity)
+    except (TypeError, ValueError):
+        return None, 'Enter your quantity in tons (numbers only).', 400
+    if not 0 < quantity <= 100: return None, 'Quantity must be between 0.1 and 100 tons.', 400
+    tier = quantity_tier(quantity)
+    capacity_col = {'High': 'cap_high', 'Mid': 'cap_mid', 'Low': 'cap_low'}[tier]
+    tier_full_msg = {
+        'High': 'High-priority seats (5 tons and above) are full for this slot. Choose another slot.',
+        'Mid': 'Mid-priority seats (1 to 5 tons) are full for this slot. Choose another slot.',
+        'Low': 'Low-priority seats (below 1 ton) are full for this slot. Choose another slot.'}[tier]
+    with booking_write_guard(), engine.begin() as c:
+        lock_sql = '''SELECT s.id,s.slot_date,s.start_time,s.end_time,s.capacity,
+                COALESCE(s.cap_high,0) AS cap_high,COALESCE(s.cap_mid,0) AS cap_mid,COALESCE(s.cap_low,0) AS cap_low,
+                c.name AS centre_name
+            FROM slots s JOIN centres c ON c.id=s.centre_id WHERE s.id=:id'''
+        if not IS_SQLITE: lock_sql += ' FOR UPDATE'      # serialise bookings for this slot row
+        slot = c.execute(text(lock_sql), {'id': sid}).mappings().first()
+        if not slot: return None, 'That slot is no longer available.', 404
+        if not valid_date_str(slot['slot_date']): return None, 'That slot has an invalid date. Please choose another slot.', 400
+        if slot['slot_date'] < today_str(): return None, 'That slot is in the past. Please choose a current slot.', 400
+        # One active booking per farmer: also blocks accidental duplicate taps.
+        dup = c.execute(text(f"SELECT id FROM bookings WHERE user_id=:uid AND status IN {ACTIVE_SQL} LIMIT 1"), {'uid': u['id']}).first()
+        if dup: return None, 'You already have an active booking. Open your ticket instead.', 409
+        quota = int(slot[capacity_col] or 0)
+        taken = int(c.execute(text(f"SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND tier=:tier AND status IN {ACTIVE_SQL}"), {'id': sid, 'tier': tier}).scalar() or 0)
+        if taken >= quota: return None, tier_full_msg, 409
+        # One conditional INSERT enforces the tier quota + allocates the token, so two
+        # simultaneous farmers of the same tier can never overbook the same quota.
+        created_at = now_iso()
+        booking_created_at = lifecycle_now_iso()
+        q = c.execute(text(f'''INSERT INTO bookings(user_id,slot_id,name,phone,crop,quantity_tons,tier,token,status,procurement_status,payment_status,created_at,booking_created_at)
+            SELECT CAST(:uid AS INTEGER),CAST(:sid AS INTEGER),CAST(:n AS VARCHAR(200)),CAST(:p AS VARCHAR(30)),CAST(:crop AS VARCHAR(100)),
+                   CAST(:qty AS REAL),CAST(:tier AS VARCHAR(10)),
+                   (SELECT COALESCE(MAX(token),0)+1 FROM bookings),'Waiting','Booked','Not started',CAST(:now AS VARCHAR(50)),:booking_created_at
+            WHERE (SELECT COUNT(*) FROM bookings WHERE slot_id=CAST(:sid AS INTEGER) AND tier=CAST(:tier AS VARCHAR(10)) AND status IN {ACTIVE_SQL})<CAST(:quota AS INTEGER)
+            RETURNING id,token'''),
+            {'uid': u['id'], 'sid': sid, 'n': u['name'], 'p': u['phone'], 'crop': crop, 'qty': quantity, 'tier': tier,
+             'now': created_at, 'booking_created_at': booking_created_at, 'quota': quota})
+        row = q.mappings().first()
+        if not row and IS_SQLITE:
+            taken2 = int(c.execute(text(f"SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND tier=:tier AND status IN {ACTIVE_SQL}"), {'id': sid, 'tier': tier}).scalar() or 0)
+            if taken2 >= quota: return None, tier_full_msg, 409
+            nxt = int(c.execute(text('SELECT COALESCE(MAX(token),0)+1 FROM bookings')).scalar() or 1)
+            c.execute(text('''INSERT INTO bookings(user_id,slot_id,name,phone,crop,quantity_tons,tier,token,status,procurement_status,payment_status,created_at,booking_created_at)
+                VALUES(:uid,:sid,:n,:p,:crop,:qty,:tier,:tok,'Waiting','Booked','Not started',:now,:booking_created_at)'''),
+                {'uid': u['id'], 'sid': sid, 'n': u['name'], 'p': u['phone'], 'crop': crop, 'qty': quantity,
+                 'tier': tier, 'tok': nxt, 'now': created_at, 'booking_created_at': booking_created_at})
+            row = {'id': c.execute(text('SELECT id FROM bookings WHERE user_id=:uid AND slot_id=:sid ORDER BY id DESC LIMIT 1'), {'uid': u['id'], 'sid': sid}).scalar(), 'token': nxt}
+        if not row: return None, tier_full_msg, 409
+        bid, token = int(row['id']), int(row['token'])
+        queue_size = int(c.execute(text(f'SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND status IN {ACTIVE_SQL}'), {'id': sid}).scalar() or 1)
+    return {
+        'success': True, 'booking_id': bid, 'token': token,
+        'slot': f"{slot['start_time']} - {slot['end_time']}",
+        'centre': slot['centre_name'], 'slot_date': slot['slot_date'],
+        'tier': tier, 'quantity_tons': quantity,
+        'ahead': queue_size - 1, 'position': queue_size
+    }, None, 201
+
+
 @app.post('/api/book')
 @login_required('farmer')
 def book():
     """Book with strict High/Mid/Low quota - tier comes from quantity in tons. Same quantity = same tier."""
-    data=request.get_json(silent=True) or {}
-    u=current_user()
-    crop=str(data.get('crop','')).strip()[:100]
-    if not crop: return api_error('Choose a crop before booking.',400)
-    try: sid=int(data.get('slot_id'))
-    except (TypeError,ValueError): return api_error('Choose an available slot.',400)
+    data = request.get_json(silent=True) or {}
+    u = current_user()
+    crop = str(data.get('crop', '')).strip()[:100]
+    sid = data.get('slot_id')
+    qty = data.get('quantity_tons', data.get('quantity', ''))
+    res, err, code = execute_booking(u, crop, sid, qty)
+    if err:
+        return api_error(err, code)
+    return jsonify(res), 201
+
+
+def query_available_slots(centre_id, slot_date, quantity_tons=None):
+    """Retrieve available slots filtered by tier quota for a centre and date."""
+    if not valid_date_str(slot_date):
+        return []
     try:
-        quantity=float(data.get('quantity_tons', data.get('quantity', '')))
-    except (TypeError,ValueError):
-        return api_error('Enter your quantity in tons (numbers only).',400)
-    if not 0 < quantity <= 100: return api_error('Quantity must be between 0.1 and 100 tons.',400)
-    tier=quantity_tier(quantity)
-    capacity_col={'High':'cap_high','Mid':'cap_mid','Low':'cap_low'}[tier]
-    tier_full_msg={
-        'High':'High-priority seats (5 tons and above) are full for this slot. Choose another slot.',
-        'Mid':'Mid-priority seats (1 to 5 tons) are full for this slot. Choose another slot.',
-        'Low':'Low-priority seats (below 1 ton) are full for this slot. Choose another slot.'}[tier]
-    with booking_write_guard(), engine.begin() as c:
-        lock_sql='''SELECT s.id,s.slot_date,s.start_time,s.end_time,s.capacity,
-                COALESCE(s.cap_high,0) AS cap_high,COALESCE(s.cap_mid,0) AS cap_mid,COALESCE(s.cap_low,0) AS cap_low,
-                c.name AS centre_name
-            FROM slots s JOIN centres c ON c.id=s.centre_id WHERE s.id=:id'''
-        if not IS_SQLITE: lock_sql+=' FOR UPDATE'      # serialise bookings for this slot row
-        slot=c.execute(text(lock_sql),{'id':sid}).mappings().first()
-        if not slot: return api_error('That slot is no longer available.',404)
-        if not valid_date_str(slot['slot_date']): return api_error('That slot has an invalid date. Please choose another slot.',400)
-        if slot['slot_date']<today_str(): return api_error('That slot is in the past. Please choose a current slot.',400)
-        # One active booking per farmer: also blocks accidental duplicate taps.
-        dup=c.execute(text(f"SELECT id FROM bookings WHERE user_id=:uid AND status IN {ACTIVE_SQL} LIMIT 1"),{'uid':u['id']}).first()
-        if dup: return api_error('You already have an active booking. Open your ticket instead.',409)
-        quota=int(slot[capacity_col] or 0)
-        taken=int(c.execute(text(f"SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND tier=:tier AND status IN {ACTIVE_SQL}"),{'id':sid,'tier':tier}).scalar() or 0)
-        if taken>=quota: return api_error(tier_full_msg,409)
-        # One conditional INSERT enforces the tier quota + allocates the token, so two
-        # simultaneous farmers of the same tier can never overbook the same quota.
-        q=c.execute(text(f'''INSERT INTO bookings(user_id,slot_id,name,phone,crop,quantity_tons,tier,token,status,procurement_status,payment_status,created_at)
-            SELECT CAST(:uid AS INTEGER),CAST(:sid AS INTEGER),CAST(:n AS VARCHAR(200)),CAST(:p AS VARCHAR(30)),CAST(:crop AS VARCHAR(100)),
-                   CAST(:qty AS REAL),CAST(:tier AS VARCHAR(10)),
-                   (SELECT COALESCE(MAX(token),0)+1 FROM bookings),'Waiting','Booked','Not started',CAST(:now AS VARCHAR(50))
-            WHERE (SELECT COUNT(*) FROM bookings WHERE slot_id=CAST(:sid AS INTEGER) AND tier=CAST(:tier AS VARCHAR(10)) AND status IN {ACTIVE_SQL})<CAST(:quota AS INTEGER)
-            RETURNING id,token'''),
-            {'uid':u['id'],'sid':sid,'n':u['name'],'p':u['phone'],'crop':crop,'qty':quantity,'tier':tier,'now':now_iso(),'quota':quota})
-        row=q.mappings().first()
-        if not row and IS_SQLITE:
-            # SQLite cannot reference the row being RETURNED inside its own SELECT subquery,
-            # so the conditional INSERT above writes nothing there. Fall back to an
-            # explicit tier-quota check + plain INSERT under the same write guard + transaction.
-            taken2=int(c.execute(text(f"SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND tier=:tier AND status IN {ACTIVE_SQL}"),{'id':sid,'tier':tier}).scalar() or 0)
-            if taken2>=quota: return api_error(tier_full_msg,409)
-            nxt=int(c.execute(text('SELECT COALESCE(MAX(token),0)+1 FROM bookings')).scalar() or 1)
-            c.execute(text('''INSERT INTO bookings(user_id,slot_id,name,phone,crop,quantity_tons,tier,token,status,procurement_status,payment_status,created_at)
-                VALUES(:uid,:sid,:n,:p,:crop,:qty,:tier,:tok,'Waiting','Booked','Not started',:now)'''),
-                {'uid':u['id'],'sid':sid,'n':u['name'],'p':u['phone'],'crop':crop,'qty':quantity,'tier':tier,'tok':nxt,'now':now_iso()})
-            row={'id':c.execute(text('SELECT id FROM bookings WHERE user_id=:uid AND slot_id=:sid ORDER BY id DESC LIMIT 1'),{'uid':u['id'],'sid':sid}).scalar(),'token':nxt}
-        if not row: return api_error(tier_full_msg,409)
-        bid,token=int(row['id']),int(row['token'])
-        queue_size=int(c.execute(text(f'SELECT COUNT(*) FROM bookings WHERE slot_id=:id AND status IN {ACTIVE_SQL}'),{'id':sid}).scalar() or 1)
-    return jsonify(success=True,booking_id=bid,token=token,slot=f"{slot['start_time']} - {slot['end_time']}",
-                   centre=slot['centre_name'],slot_date=slot['slot_date'],tier=tier,quantity_tons=quantity,
-                   ahead=queue_size-1,position=queue_size),201
+        cid = int(centre_id)
+    except (TypeError, ValueError):
+        return []
+    slot_list = rows(f'''SELECT s.id,s.centre_id,s.slot_date,s.start_time,s.end_time,s.capacity,
+            COALESCE(s.cap_high,0) AS cap_high, COALESCE(s.cap_mid,0) AS cap_mid, COALESCE(s.cap_low,0) AS cap_low,
+            c.name AS centre_name,
+            (SELECT COUNT(*) FROM bookings b WHERE b.slot_id=s.id AND b.status IN {ACTIVE_SQL}) AS booked,
+            (s.capacity-(SELECT COUNT(*) FROM bookings b WHERE b.slot_id=s.id AND b.status IN {ACTIVE_SQL})) AS remaining,
+            (COALESCE(s.cap_high,0)-(SELECT COUNT(*) FROM bookings b WHERE b.slot_id=s.id AND b.tier='High' AND b.status IN {ACTIVE_SQL})) AS remaining_high,
+            (COALESCE(s.cap_mid,0)-(SELECT COUNT(*) FROM bookings b WHERE b.slot_id=s.id AND b.tier='Mid' AND b.status IN {ACTIVE_SQL})) AS remaining_mid,
+            (COALESCE(s.cap_low,0)-(SELECT COUNT(*) FROM bookings b WHERE b.slot_id=s.id AND b.tier='Low' AND b.status IN {ACTIVE_SQL})) AS remaining_low
+        FROM slots s JOIN centres c ON c.id=s.centre_id
+        WHERE s.centre_id=:cid AND s.slot_date=:d ORDER BY s.start_time''', {'cid': cid, 'd': slot_date})
+    if quantity_tons is None:
+        return [s for s in slot_list if s.get('remaining', 0) > 0]
+    tier = quantity_tier(quantity_tons)
+    if not tier:
+        return [s for s in slot_list if s.get('remaining', 0) > 0]
+    rem_key = {'High': 'remaining_high', 'Mid': 'remaining_mid', 'Low': 'remaining_low'}[tier]
+    return [s for s in slot_list if s.get(rem_key, 0) > 0]
+
+
+@app.post('/api/voice/assistant')
+@login_required('farmer')
+def voice_assistant():
+    """Structured Conversational Booking Assistant endpoint."""
+    data = request.get_json(silent=True) or {}
+    text_input = str(data.get('text', ''))[:400]
+    state = data.get('state') if isinstance(data.get('state'), dict) else {}
+    centre_id = data.get('centre_id')
+    language = str(data.get('language') or session.get('lang') or 'en')
+    reset = bool(data.get('reset'))
+
+    if not centre_id:
+        c_row = one("SELECT id FROM centres ORDER BY id LIMIT 1")
+        centre_id = c_row['id'] if c_row else 1
+    else:
+        try:
+            centre_id = int(centre_id)
+        except (TypeError, ValueError):
+            c_row = one("SELECT id FROM centres ORDER BY id LIMIT 1")
+            centre_id = c_row['id'] if c_row else 1
+
+    if data.get('action') == 'book_again':
+        # Book Again: seed a NEW conversation from this farmer's own most
+        # recent cancelled booking. The cancelled row is only read, never
+        # modified, and the client never supplies the booking id (no spoofing).
+        u = current_user()
+        prev = one('''SELECT b.crop, b.quantity_tons, s.slot_date
+            FROM bookings b JOIN slots s ON s.id=b.slot_id
+            WHERE b.user_id=:uid AND b.status=:st
+            ORDER BY b.id DESC LIMIT 1''', {'uid': u['id'], 'st': CANCELLED})
+        if not prev:
+            return api_error('No recently cancelled booking found to reuse.', 404)
+        qty_kg = prev['quantity_tons']
+        assistant = nlp.BookingAssistant(state=None,
+                                         today=datetime.now().date(),
+                                         language=language)
+        res = assistant.start_book_again({
+            'crop': prev['crop'],
+            'quantity_kg': int(round((qty_kg or 0) * 1000)) if qty_kg else None,
+            'date': prev['slot_date'],
+        })
+        return jsonify(res)
+
+    assistant = nlp.BookingAssistant(state=None if reset else state,
+                                     today=datetime.now().date(),
+                                     language=language)
+
+    if reset or data.get('action') == 'start':
+        res = assistant.start()
+        return jsonify(res)
+
+    res = assistant.process_turn(text_input)
+
+    # When slot check is requested by the state machine
+    if res['conv_state'] == nlp.CHECKING_SLOTS:
+        booking_date = assistant.state.get('date')
+        qty_kg = assistant.state.get('quantity_kg') or 500
+        qty_tons = round(qty_kg / 1000.0, 3)
+        avail = query_available_slots(centre_id, booking_date, qty_tons)
+        res = assistant.check_slots_with_backend(avail)
+
+    # When booking creation is reached
+    elif res['conv_state'] == nlp.BOOKING or res.get('action') == 'create_booking':
+        selected_slot = assistant.state.get('selected_slot')
+        crop = assistant.state.get('crop')
+        qty_kg = assistant.state.get('quantity_kg')
+        qty_tons = round((qty_kg or 0) / 1000.0, 3)
+        if not selected_slot or not selected_slot.get('id'):
+            return api_error("No slot selected for booking.", 400)
+        book_res, err, code = execute_booking(current_user(), crop, selected_slot['id'], qty_tons)
+        if err:
+            res = assistant._response(assistant._msg('booking_failed', {'error': err}),
+                                      nlp.WAITING_FOR_SLOT_SELECTION)
+            res['error'] = err
+            return jsonify(res), 200
+        res = assistant.confirm_booking_success(book_res)
+
+    return jsonify(res)
 
 
 def queue_metrics(item):
@@ -569,7 +796,7 @@ def queue_metrics(item):
 
 def booking_row_for_user(uid):
     r=rows('''SELECT b.id,b.user_id,b.slot_id,b.name,b.phone,b.crop,b.quantity_tons,b.tier,b.token,b.status,b.procurement_status,b.created_at,
-            s.slot_date,s.start_time,s.end_time,s.capacity,c.name AS centre
+            s.slot_date,s.start_time,s.end_time,s.capacity,s.centre_id,c.name AS centre
         FROM bookings b JOIN slots s ON s.id=b.slot_id JOIN centres c ON c.id=s.centre_id
         WHERE b.user_id=:uid ORDER BY b.id DESC LIMIT 1''',{'uid':uid})
     return queue_metrics(r[0]) if r else None
@@ -578,6 +805,95 @@ def booking_row_for_user(uid):
 @login_required('farmer')
 def my_booking():
     item=booking_row_for_user(current_user()['id']); return jsonify(item or {'booking':None})
+
+@app.get('/api/my-bookings')
+@login_required('farmer')
+def my_bookings():
+    """The farmer's own booking history (newest first), for Book Again + history view.
+
+    Always scoped to the session user; another farmer's rows can never appear.
+    The cancelled row stays untouched - a Book Again flow just adds a new row.
+    """
+    u=current_user()
+    items=rows('''SELECT b.id,b.token,b.status,b.crop,b.quantity_tons,b.tier,b.created_at,
+            s.slot_date,s.start_time,s.centre_id,c.name AS centre
+        FROM bookings b JOIN slots s ON s.id=b.slot_id JOIN centres c ON c.id=s.centre_id
+        WHERE b.user_id=:uid ORDER BY b.id DESC LIMIT 20''',{'uid':u['id']})
+    return jsonify(success=True, bookings=items)
+
+@app.get('/api/farmer/status')
+@login_required('farmer')
+def farmer_status_api():
+    """Dedicated status API for /farmer/status (refresh-safe, ownership-checked).
+
+    Identifier comes from the server session (current_user), never from JS
+    memory. Optional ?booking_id= is honoured ONLY when that booking belongs
+    to the logged-in farmer; otherwise 403 — never another farmer's data.
+    Reuses the existing booking_row_for_user()/queue_metrics() response shape
+    ({id,token,status,...,ahead,position,queue_size}) so no duplicate logic.
+    """
+    u = current_user()
+    raw = (request.args.get('booking_id') or '').strip()
+    if not raw:
+        item = booking_row_for_user(u['id'])
+        return jsonify(success=True, booking=item)
+    try:
+        bid = int(raw)
+    except (TypeError, ValueError):
+        return api_error('Invalid booking reference.', 400)
+    item = rows('''SELECT b.id,b.user_id,b.slot_id,b.name,b.phone,b.crop,b.quantity_tons,b.tier,b.token,b.status,b.procurement_status,b.created_at,
+            s.slot_date,s.start_time,s.end_time,s.capacity,s.centre_id,c.name AS centre
+        FROM bookings b JOIN slots s ON s.id=b.slot_id JOIN centres c ON c.id=s.centre_id
+        WHERE b.id=:id''', {'id': bid})
+    if not item:
+        return api_error('Booking not found.', 404)
+    if item[0]['user_id'] != u['id']:
+        return api_error('Access denied.', 403)
+    return jsonify(success=True, booking=queue_metrics(item[0]))
+
+@app.post('/api/nlp/parse')
+@login_required('farmer')
+def nlp_parse():
+    """Understand one farmer utterance: intent, entities and the next dialogue step.
+
+    Pure language understanding (nlp.py). It NEVER decides whether a slot is
+    free - the client still asks GET /api/slots and books through POST /api/book.
+    The conversation state round-trips through the browser, so this endpoint
+    stays stateless; the state itself is language-independent, so the same step
+    renders in English, Telugu or Hindi (requirement 9).
+    """
+    data = request.get_json(silent=True) or {}
+    text = str(data.get('text') or '')[:400]
+    state = data.get('state') if isinstance(data.get('state'), dict) else {}
+    conv = nlp.Conversation(state=state)
+    if data.get('reset'):
+        conv.reset()
+    result = conv.step(text)
+    return jsonify(success=True, intent=result['intent'],
+                   intent_confidence=result['intent_confidence'],
+                   entities=result['entities'], confidence=result['confidence'],
+                   corrections=result['corrections'], ambiguous=result['ambiguous'],
+                   understood=result['understood'], slots_needed=result['slots_needed'],
+                   next=result['next'], state=result['state'])
+
+@app.get('/api/nlp/suggest')
+@login_required('farmer')
+def nlp_suggest():
+    """Context-aware word/phrase prediction for the typed box (requirement 12).
+
+    `expected` is the question being answered and crop/date are what is already
+    known, so the completer finishes the sentence, not just the word - and it
+    returns nothing when the fragment is too short to guess safely (req. 1).
+    """
+    context = {}
+    for key in ('crop', 'date'):
+        value = (request.args.get(key) or '').strip()[:40]
+        if value:
+            context[key] = value
+    expected = (request.args.get('expected') or '').strip() or None
+    suggestions = nlp.suggest(request.args.get('q', ''), expected=expected,
+                              state=context, limit=8)
+    return jsonify(success=True, suggestions=suggestions)
 
 @app.get('/api/notifications')
 @app.get('/api/my-notifications')
@@ -661,6 +977,85 @@ def stats():
     payload.update({k:int(v or 0) for k,v in slots.items()})
     return jsonify(payload)
 
+
+def booking_time_metrics(item):
+    """Return elapsed lifecycle durations in seconds when both events exist."""
+    def parse(value):
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            return None
+
+    def elapsed(start, end):
+        start_dt, end_dt = parse(item.get(start)), parse(item.get(end))
+        if not start_dt or not end_dt:
+            return None
+        # Old rows use timezone-naive timestamps; compare naive values as stored.
+        if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+            start_dt, end_dt = start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None)
+        seconds = (end_dt - start_dt).total_seconds()
+        return round(seconds, 3) if seconds >= 0 else None
+
+    return {
+        'waiting_time_seconds': elapsed('booking_created_at', 'called_at'),
+        'service_time_seconds': elapsed('served_at', 'completed_at'),
+        'total_processing_time_seconds': elapsed('booking_created_at', 'completed_at'),
+    }
+
+
+ANALYTICS_BOOKING_SELECT = '''SELECT b.id,b.crop,b.status,b.booking_created_at,b.called_at,b.served_at,
+        b.completed_at,b.cancelled_at,s.slot_date,s.start_time,s.end_time,c.name AS centre
+    FROM bookings b JOIN slots s ON s.id=b.slot_id JOIN centres c ON c.id=s.centre_id'''
+
+
+@app.get('/api/analytics')
+@login_required('admin')
+def analytics():
+    """Read-only historical aggregates for the admin analytics panel."""
+    booking_rows = rows(ANALYTICS_BOOKING_SELECT)
+    enriched = [(item, booking_time_metrics(item)) for item in booking_rows]
+
+    def average(metric):
+        values = [durations[metric] for _, durations in enriched if durations[metric] is not None]
+        return round(sum(values) / len(values), 3) if values else None
+
+    by_crop, by_centre, by_slot = {}, {}, {}
+    for item, _ in enriched:
+        by_crop[item['crop']] = by_crop.get(item['crop'], 0) + 1
+        by_centre[item['centre']] = by_centre.get(item['centre'], 0) + 1
+        slot_key = f"{item['centre']} • {item['slot_date']} {item['start_time']}–{item['end_time']}"
+        by_slot[slot_key] = by_slot.get(slot_key, 0) + 1
+    return jsonify({
+        'total_bookings': len(booking_rows),
+        'completed_bookings': sum(1 for item in booking_rows if item['status'] == COMPLETED),
+        'average_waiting_time_seconds': average('waiting_time_seconds'),
+        'average_service_time_seconds': average('service_time_seconds'),
+        'average_total_processing_time_seconds': average('total_processing_time_seconds'),
+        'waiting_time_sample_count': sum(1 for _, m in enriched if m['waiting_time_seconds'] is not None),
+        'service_time_sample_count': sum(1 for _, m in enriched if m['service_time_seconds'] is not None),
+        'bookings_by_crop': [{'crop': k, 'count': v} for k, v in sorted(by_crop.items(), key=lambda x: (-x[1], x[0]))],
+        'bookings_by_centre': [{'centre': k, 'count': v} for k, v in sorted(by_centre.items(), key=lambda x: (-x[1], x[0]))],
+        'bookings_by_slot': [{'slot': k, 'count': v} for k, v in sorted(by_slot.items(), key=lambda x: (-x[1], x[0]))[:100]],
+    })
+
+
+@app.get('/api/analytics/bookings/<int:bid>')
+@login_required('admin')
+def analytics_booking(bid):
+    """Read-only lifecycle timestamps and derived durations for one booking."""
+    item = one(ANALYTICS_BOOKING_SELECT + ' WHERE b.id=:id', {'id': bid})
+    if not item:
+        return api_error('Booking not found.', 404)
+    item.update(booking_time_metrics(item))
+    for key in ('booking_created_at', 'called_at', 'served_at', 'completed_at', 'cancelled_at'):
+        if isinstance(item.get(key), datetime):
+            item[key] = item[key].isoformat()
+    return jsonify(item)
+
 # --- booking status machine (PRD section 10) --------------------------------
 CALL_MESSAGE='Token #{token} is being called. Please proceed to the procurement counter.'
 SERVE_MESSAGE='Token #{token} is now being served. Please proceed to the counter.'
@@ -674,18 +1069,29 @@ def transition_booking(bid, target, message_template=None, kind='info'):
     Returns (result, error_message, http_status). Invalid transitions are refused
     so the queue can never jump backwards from a finished state.
     """
-    with booking_write_guard(), engine.begin() as c:
-        row=c.execute(text('SELECT id,user_id,status,token FROM bookings WHERE id=:id'),{'id':bid}).mappings().first()
-        if not row: return None,'Booking not found.',404
-        current=row['status']
-        if target!=current and target not in VALID_TRANSITIONS.get(current,set()):
-            return None,f'A booking that is {current} cannot be moved to {target}.',409
-        if target!=current:
-            c.execute(text('UPDATE bookings SET status=:s,procurement_status=:p WHERE id=:id'),
-                      {'s':target,'p':PROCUREMENT_STATUS.get(target,'Booked'),'id':bid})
-            if message_template:
-                c.execute(text('INSERT INTO notifications(user_id,booking_id,message,kind,is_read,created_at) VALUES(:uid,:bid,:msg,:kind,0,:now)'),
-                          {'uid':row['user_id'],'bid':bid,'msg':message_template.format(token=row['token']),'kind':kind,'now':now_iso()})
+    try:
+        with booking_write_guard(), engine.begin() as c:
+            row=c.execute(text('SELECT id,user_id,status,token FROM bookings WHERE id=:id'),{'id':bid}).mappings().first()
+            if not row: return None,'Booking not found.',404
+            current=row['status']
+            if target!=current and target not in VALID_TRANSITIONS.get(current,set()):
+                return None,f'A booking that is {current} cannot be moved to {target}.',409
+            if target!=current:
+                event_column = {CALLED: 'called_at', SERVING: 'served_at',
+                                COMPLETED: 'completed_at', CANCELLED: 'cancelled_at'}.get(target)
+                event_sql = f', {event_column}=:event_at' if event_column else ''
+                params = {'s':target, 'p':PROCUREMENT_STATUS.get(target,'Booked'), 'id':bid}
+                if event_column:
+                    params['event_at'] = lifecycle_now_iso()
+                c.execute(text(f'UPDATE bookings SET status=:s,procurement_status=:p{event_sql} WHERE id=:id'), params)
+                if message_template:
+                    c.execute(text('INSERT INTO notifications(user_id,booking_id,message,kind,is_read,created_at) VALUES(:uid,:bid,:msg,:kind,0,:now)'),
+                              {'uid':row['user_id'],'bid':bid,'msg':message_template.format(token=row['token']),'kind':kind,'now':now_iso()})
+    except SQLAlchemyError:
+        # engine.begin() already rolled back. Log loudly so "dead after 2 calls"
+        # is diagnosable instead of a silent hang on the frontend.
+        app.logger.exception('transition_booking failed for booking %s -> %s', bid, target)
+        return None,'Database is busy. Please wait a moment and try again.',503
     return {'id':bid,'token':row['token'],'status':target,'previous_status':current},None,200
 
 
@@ -756,7 +1162,7 @@ def booking(bid):
     """Farmer polling endpoint - a farmer can only ever open their own booking (NFR-01)."""
     u=current_user()
     item=rows('''SELECT b.id,b.user_id,b.slot_id,b.name,b.phone,b.crop,b.quantity_tons,b.tier,b.token,b.status,b.procurement_status,b.created_at,
-            s.slot_date,s.start_time,s.end_time,s.capacity,c.name AS centre
+            s.slot_date,s.start_time,s.end_time,s.capacity,s.centre_id,c.name AS centre
         FROM bookings b JOIN slots s ON s.id=b.slot_id JOIN centres c ON c.id=s.centre_id
         WHERE b.id=:id AND b.user_id=:uid''',{'id':bid,'uid':u['id']})
     if not item: return api_error('Booking not found.',404)
@@ -767,6 +1173,18 @@ def harden_response(response):
     """No caching for live queue data, plus a few baseline security headers."""
     if request.path.startswith('/api/') or request.path == '/health':
         response.headers['Cache-Control'] = 'no-store'
+    origin = request.headers.get('Origin')
+    if origin and _is_allowed_origin(origin):
+        # Exact origin (never '*') + credentials, so the session cookie keeps
+        # working for same-site local dev (e.g. Live Server :5500 -> :5000).
+        # Same-origin page loads send no Origin on GET and are unaffected.
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Vary'] = 'Origin'
+        if request.method == 'OPTIONS':
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            response.headers['Access-Control-Max-Age'] = '600'
     response.headers.setdefault('X-Content-Type-Options', 'nosniff')
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'same-origin')
@@ -790,4 +1208,4 @@ def handle_unexpected_error(error):
     return 'Server error. Please try again.', 500
 
 db_init()
-if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)),debug=os.environ.get('FLASK_DEBUG','0')=='1')
+if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)),debug=os.environ.get('FLASK_DEBUG','0')=='1',threaded=True)
